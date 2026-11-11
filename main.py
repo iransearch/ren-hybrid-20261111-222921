@@ -23,9 +23,9 @@ import tempfile
 import time
 
 LOG = logging.getLogger('ren_control')
-BUILD = 'ren-hybrid-1'
+BUILD = 'ren-hybrid-3-multi-origin'
 ROOT = Path(__file__).resolve().parent
-ORIGIN_KEYS = {'ORIGIN_IP', 'ORIGIN_PORT', 'ORIGIN_SNI', 'ORIGIN_ENABLED'}
+ORIGIN_KEYS = {'ORIGIN_IP', 'ORIGIN_PORT', 'ORIGIN_SNI', 'ORIGIN_ENABLED', 'ORIGIN_ROUTES_JSON'}
 HOSTNAME = re.compile(r'(?=.{1,253}\Z)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z')
 
 
@@ -49,9 +49,46 @@ def boolean(raw, name):
 
 
 @dataclass(frozen=True)
-class Settings:
+class Route:
+    domain: str
     origin_ip: str
     origin_sni: str
+    origin_port: int
+
+
+def parse_routes(raw, allow_private=False):
+    if not isinstance(raw, str) or len(raw.encode('utf-8')) > 65536:
+        raise ValueError('ORIGIN_ROUTES_JSON exceeds 64 KiB or is not text')
+    try: rows = json.loads(raw)
+    except (ValueError, TypeError): raise ValueError('ORIGIN_ROUTES_JSON must be valid JSON') from None
+    if not isinstance(rows, list) or not 1 <= len(rows) <= 100:
+        raise ValueError('ORIGIN_ROUTES_JSON must contain 1..100 mappings')
+    routes=[]; seen=set()
+    for row in rows:
+        if not isinstance(row, dict) or set(row) != {'domain','origin_ip','origin_sni','origin_port'}:
+            raise ValueError('Each route needs domain, origin_ip, origin_sni, origin_port only')
+        domain=str(row['domain']).strip().lower().rstrip('.')
+        host=str(row['origin_sni']).strip().lower().rstrip('.')
+        if not HOSTNAME.fullmatch(domain) or domain.endswith('.onrender.com'):
+            raise ValueError('Route domain must be a custom DNS hostname')
+        if not HOSTNAME.fullmatch(host): raise ValueError('Route SNI must be a DNS hostname')
+        if domain in seen: raise ValueError('Duplicate route domain: '+domain)
+        seen.add(domain)
+        if not isinstance(row['origin_ip'],str): raise ValueError('Route IP must be a dotted IPv4 string')
+        try: address=ipaddress.IPv4Address(row['origin_ip'])
+        except (ipaddress.AddressValueError, TypeError): raise ValueError('Route IP must be IPv4') from None
+        if (not address.is_global or address.is_multicast) and not allow_private: raise ValueError('Route IP must be public IPv4')
+        port=number({'port':row['origin_port']},'port',443,integer=True)
+        if port>65535: raise ValueError('Route port must be 1..65535')
+        routes.append(Route(domain,str(address),host,port))
+    return tuple(routes)
+
+
+@dataclass(frozen=True)
+class Settings:
+    origin_ip: str = ''
+    origin_sni: str = ''
+    routes: tuple = ()
     origin_port: int = 443
     origin_enabled: bool = True
     port: int = 10000
@@ -76,18 +113,21 @@ def load_settings(env=None):
         if not isinstance(data, dict) or set(data) - ORIGIN_KEYS:
             raise ValueError('origin settings file contains unsupported keys')
         env.update(data)
-    host = str(env.get('ORIGIN_SNI', '')).strip().lower().rstrip('.')
-    if not HOSTNAME.fullmatch(host): raise ValueError('ORIGIN_SNI must be a DNS hostname')
-    try: address = ipaddress.IPv4Address(env.get('ORIGIN_IP', ''))
-    except ipaddress.AddressValueError: raise ValueError('ORIGIN_IP must be IPv4') from None
     allow_private = boolean(env.get('ALLOW_PRIVATE_ORIGIN', 'false'), 'ALLOW_PRIVATE_ORIGIN')
-    if not address.is_global and not allow_private: raise ValueError('ORIGIN_IP must be public IPv4')
+    routes = parse_routes(env['ORIGIN_ROUTES_JSON'], allow_private) if 'ORIGIN_ROUTES_JSON' in env else ()
+    host = ''; address = ''
+    if not routes:
+        host = str(env.get('ORIGIN_SNI', '')).strip().lower().rstrip('.')
+        if not HOSTNAME.fullmatch(host): raise ValueError('ORIGIN_SNI must be a DNS hostname')
+        try: address = ipaddress.IPv4Address(env.get('ORIGIN_IP', ''))
+        except ipaddress.AddressValueError: raise ValueError('ORIGIN_IP must be IPv4') from None
+        if not address.is_global and not allow_private: raise ValueError('ORIGIN_IP must be public IPv4')
     ca = Path(env.get('ORIGIN_CA_FILE', str(ROOT / 'cloudflare_origin_ca_roots.pem'))).resolve()
     ssl.create_default_context(cafile=str(ca))  # Reject missing/invalid trust roots before launch.
     result = Settings(
-        str(address), host,
-        origin_port=number(env,'ORIGIN_PORT',443,integer=True),
-        origin_enabled=boolean(env.get('ORIGIN_ENABLED','true'),'ORIGIN_ENABLED'),
+        str(address), host, routes=routes,
+        origin_port=443 if routes else number(env,'ORIGIN_PORT',443,integer=True),
+        origin_enabled=True if routes else boolean(env.get('ORIGIN_ENABLED','true'),'ORIGIN_ENABLED'),
         port=number(env,'PORT',10000,integer=True),
         max_concurrent=number(env,'MAX_CONCURRENT',0,integer=True,zero=True),
         connect_timeout=number(env,'CONNECT_TIMEOUT',12),
@@ -143,7 +183,7 @@ def render_config(s: Settings, run_dir: Path, capacity: int):
     authority = s.origin_sni + (f':{s.origin_port}' if s.origin_port != 443 else '')
     server_limit = f' maxconn {s.max_concurrent} maxqueue 1' if s.max_concurrent else ''
     disabled = ' disabled' if not s.origin_enabled else ''
-    return f'''global
+    config = f'''global
     master-worker
     log stdout format raw local0 warning
     nbthread {s.threads}
@@ -176,6 +216,32 @@ backend origin
     http-request set-timeout server {duration(s.ws_handshake_timeout)} if {{ hdr(Upgrade) -i websocket }}
     server target {s.origin_ip}:{s.origin_port} ssl verify required ca-file {quoted(run_dir / 'origin-ca.pem')} sni str({s.origin_sni}) verifyhost {s.origin_sni} alpn http/1.1{server_limit}{disabled}
 '''
+    if not s.routes: return config
+    prefix=config.split('frontend public\n',1)[0]
+    routing=f"frontend public\n    bind 0.0.0.0:{s.port}\n"
+    routing+="    http-request return status 200 content-type application/json string '{\"status\":\"ok\"}' if { path -m str /_ren/health }\n"
+    routing+='    http-request set-var(txn.ren_route_host) req.hdr(host),lower,field(1,:)\n'
+    for route in s.routes:
+        routing+=f'    acl ren_known_host var(txn.ren_route_host) -m str {route.domain}\n'
+    routing+='    http-request return status 421 content-type text/plain string "Unknown domain" unless ren_known_host\n'
+    if s.max_concurrent:
+        routing+='    http-request set-var(txn.ren_active) int(0)\n'
+        for index in range(1,len(s.routes)+1):
+            routing+=f'    http-request set-var(txn.ren_backend_active) be_conn(origin_{index})\n'
+            routing+='    http-request set-var(txn.ren_active) var(txn.ren_active),add(txn.ren_backend_active)\n'
+        routing+=f'    http-request return status 503 content-type text/plain string "Service Unavailable" hdr Retry-After 5 if {{ var(txn.ren_active) -m int ge {s.max_concurrent} }}\n'
+    backends=[]
+    for index,route in enumerate(s.routes,1):
+        name=f'origin_{index}'
+        routing+=f'    use_backend {name} if {{ var(txn.ren_route_host) -m str {route.domain} }}\n'
+        authority=route.origin_sni+(f':{route.origin_port}' if route.origin_port!=443 else '')
+        backends.append(f"""backend {name}
+    http-request set-header Host {authority}
+    http-request set-timeout server {duration(s.ws_handshake_timeout)} if {{ hdr(Upgrade) -i websocket }}
+    server target {route.origin_ip}:{route.origin_port} ssl verify required ca-file {quoted(run_dir / 'origin-ca.pem')} sni str({route.origin_sni}) verifyhost {route.origin_sni} alpn http/1.1{server_limit}
+""")
+    return prefix+routing+'\n'+'\n'.join(backends)
+
 
 
 def runtime_command(path: Path, command: str, timeout=2):
@@ -259,10 +325,10 @@ def haproxy_stats(stats_socket, prefix=''):
     rows=list(csv.DictReader(io.StringIO(raw.removeprefix('# '))))
     result={}
     for row in rows:
-        if row.get('pxname')=='origin' and row.get('svname')=='BACKEND':
+        if (row.get('pxname')=='origin' or row.get('pxname','').startswith('origin_')) and row.get('svname')=='BACKEND':
             for source,target in [('scur','active'),('smax','peak'),('stot','accepted_total'),('bin','bytes_in_total'),('bout','bytes_out_total'),('econ','connect_errors_total'),('eresp','response_errors_total'),('qcur','queued'),('hrsp_5xx','origin_5xx_total')]:
                 value=row.get(source,'')
-                result[target]=int(value) if value and value.isdigit() else None
+                result[target]=(result.get(target) or 0)+int(value) if value and value.isdigit() else result.get(target)
         if row.get('pxname')=='public' and row.get('svname')=='FRONTEND':
             value=row.get('hrsp_5xx',''); result['frontend_5xx_total']=int(value) if value.isdigit() else None
     return result
@@ -340,7 +406,7 @@ class Controller:
         if fresh==self.settings and not self.runtime_dirty: return
         candidate=self.validate(fresh)
         old_settings=self.settings
-        if replace(fresh,origin_enabled=old_settings.origin_enabled)==old_settings:
+        if not fresh.routes and not old_settings.routes and replace(fresh,origin_enabled=old_settings.origin_enabled)==old_settings:
             # Mark before sending: a successful command can lose its reply.
             self.runtime_dirty=True
             if self._runtime_enabled()!=fresh.origin_enabled:

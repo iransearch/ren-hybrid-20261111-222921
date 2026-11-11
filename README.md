@@ -1,3 +1,17 @@
+# Multiple independent domain mappings
+
+The Windows installer supports multiple X-UI origins in one Render service. `ORIGIN_ROUTES_JSON` is an authoritative JSON array of objects with exactly `domain`, `origin_ip`, `origin_sni`, `origin_port`. Set it as a Render environment variable, never commit live configuration. Example schema (replace the documentation address before use):
+
+```json
+[{"domain":"de.example.com","origin_ip":"203.0.113.10","origin_sni":"origin.example.com","origin_port":2083}]
+```
+
+Each HTTP Host routes to its own TLS-verified origin. Host matching is case-insensitive and ignores the optional port. Backend Host is rewritten to origin SNI plus its nonstandard port. Unknown hosts return 421; the gateway health path remains public. HTTP streams and WebSockets retain the selected backend. Each origin has an independent port; `PORT` is one internal HTTP listener behind Render TLS termination and does not expose another public port.
+
+At most 100 routes / 64 KiB. Invalid or duplicate domains fail startup/config validation. When this key is absent, legacy `ORIGIN_*` behavior remains supported as described below. With the key present, stale legacy origin values are ignored. The route table is read at startup; environment changes require deployment. The installer registers all domains on the selected service and deploys after the env update. Route removal keeps Render/DNS registrations but stops forwarding to that origin. Existing sessions follow the platform deployment lifecycle; no cross-origin fallback is performed.
+
+The following documentation describes the legacy control and deployment architecture; the multi-origin mode supersedes single-backend configuration examples when ORIGIN_ROUTES_JSON is set.
+
 # REN Hybrid — Python مدیریت، HAProxy انتقال داده
 
 این بسته جایگزین آزمایشی gateway تک-origin است. HAProxy مستقیماً روی PORT گوش می‌دهد؛
